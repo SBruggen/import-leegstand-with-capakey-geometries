@@ -1,6 +1,8 @@
 import pandas as pd
 import geopandas as gpd
-from sqlalchemy import create_engine, MetaData, Table, Column, func, insert, inspect
+from datetime import datetime
+import psycopg2
+from sqlalchemy import create_engine, Column, func, insert, inspect, text
 from sqlalchemy import Integer, String, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from geoalchemy2 import Geometry
@@ -39,7 +41,10 @@ Base = declarative_base()
 ### Load excel file
 
 # path
-excel_file_path = "U:/data/registers/leegstand en verwaarlozing/leegstand20231121.xlsx"
+print("Adding data from excel file in the map at location: U:/data/registers/leegstand en verwaarlozing/")
+file_name = input("What is the file name you want to add leegstand data from?: ")
+
+excel_file_path = os.path.join('U:/data/registers/leegstand en verwaarlozing/', file_name)
 
 # Read Excel data into a pandas DataFrame
 try:
@@ -117,8 +122,8 @@ print(gdf.columns)
 ### Define table model
 
 class YourTable(Base):
-    __tablename__ = 'leegstand_test3'
-    __table_args__ = {'schema': 'gemeentespecifiek'}  # Specify the schema here
+    __tablename__ = 'leegstand_leegstand_24001'
+    __table_args__ = {'schema': 'editeren'}  # Specify the schema here
 
     id = Column(Integer, primary_key=True)
     capaKey = Column('capakey', String)
@@ -127,25 +132,78 @@ class YourTable(Base):
     dossiernummer = Column('dossiernummer', String)
     internNummer = Column('internnummer', String)
     datumOpname = Column('datumopname', DateTime)
-    vip_inventaristype = Column('vip-inventaristype', String)
-    vip_status = Column('vip-status', String)
-    vip_statuscode = Column('vip-statuscode', Integer)
-    vip_typeonroerendgoed = Column('vip-typeonroerendgoed', String)
+    vip_inventaristype = Column('vip_inventaristype', String)
+    vip_status = Column('vip_status', String)
+    vip_statuscode = Column('vip_statuscode', Integer)
+    vip_typeonroerendgoed = Column('vip_typeonroerendgoed', String)
     postcode = Column('postcode', Integer)
     gemeente = Column('gemeente', String)
     straat = Column('straat', String)
     huisnummer = Column('huisnummer', String)
     busnummer = Column('busnummer', String)
     geometry = Column('geometry', Geometry(geometry_type='MULTIPOLYGON', srid=0))
+    created_by = Column(String)  # Add created_by column
+    created_at = Column(DateTime)  # Add created_at column
 
-# function to drop and recreate the table
+'''# function to drop and recreate the table
 def recreate_table(engine, table_class):
     table_class.__table__.drop(engine, checkfirst=True)
     Base.metadata.create_all(engine)
     print(f"Table '{table_class.__table_args__['schema']}.{table_class.__tablename__}' recreated.")
 
 # Drop and recreate the table to ensure correct structure
-recreate_table(engine, YourTable)
+#recreate_table(engine, YourTable)'''
+
+# check differences with existing data
+def check_for_differences_and_prompt(session, gdf, table, schema):
+    """
+    Check for differences between the data in the GeoDataFrame and the existing data in the SQLAlchemy table.
+    Prompt the user to decide whether to drop the existing data and rewrite it.
+
+    :param session: SQLAlchemy session object.
+    :param gdf: GeoDataFrame containing the new data.
+    :param table: SQLAlchemy Table object representing the target table.
+    :param schema: The schema where the table is located.
+    :return: True if the data should be replaced, False otherwise.
+    """
+    # Convert GeoDataFrame columns to lower case
+    gdf.columns = [col.lower() for col in gdf.columns]
+    
+    # Load existing data from the table
+    existing_data = pd.read_sql_table(table.__tablename__, session.bind, schema = schema)
+
+    # Check for differences based on the specified columns
+    differences = gdf[['capakey', 'internnummer', 'datumopname']].merge(
+        existing_data[['capakey', 'internnummer', 'datumopname']], 
+        on=['capakey', 'internnummer', 'datumopname'], 
+        how='outer', 
+        indicator=True
+    ).loc[lambda x: x['_merge'] != 'both']
+
+    if not differences.empty:
+        print("Differences found in the following records:")
+        print(differences[['capakey', 'internnummer', 'datumopname', '_merge']])
+        
+        while True:
+            user_input = input("Do you want to drop the existing data and rewrite it? (yes/no): ").strip().lower()
+            if user_input in ['yes', 'no']:
+                break
+            else:
+                print("Invalid input, please enter 'yes' or 'no'.")
+
+        return user_input == 'yes'
+    
+    return False
+
+def drop_existing_data(session, table, schema):
+    """
+    Drop all data from the specified table while keeping the table structure intact.
+
+    :param session: SQLAlchemy session object.
+    :param table: SQLAlchemy Table object representing the target table.
+    """
+    session.execute(text(f"TRUNCATE TABLE {schema}.{table.__tablename__};"))
+    session.commit()
 
 # function for checking table structure
 def check_table_structure(engine, table_class):
@@ -183,8 +241,60 @@ check_table_structure(engine, YourTable)
 
 ### Add data from gdf
 
+# retrieve user id
+def pass_user_id(user_name):
+    """Pass user id from user name."""
+    try:
+        # Connect to the PostgreSQL database
+        conn = psycopg2.connect(
+            dbname=db_name,
+            user=db_user,
+            password=db_password,
+            host=db_host,
+            port=db_port
+        )
+        cur = conn.cursor()
+
+        # SQL query to fetch user id
+        query = """
+        SELECT id
+        FROM identity_server.asp_net_users
+        WHERE user_name = %s;
+        """    
+        cur.execute(query, (user_name,))
+        
+        # Fetch the result
+        result = cur.fetchone()
+        
+        if result:
+            user_id = result[0]
+            print("User id successfully returned")
+            return user_id
+        else:
+            print("User not found")
+            return None
+
+    except Exception as e:
+        print(f"Error: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            cur.close()
+            conn.close()
+
+def format_user_name(first_name, last_name):
+    """Format the user name according to the specific pattern."""
+    return f"STADAARSCHOT_{first_name.lower()}.{last_name.lower()}"
+
+print("/nUser information needed to add as editor new data.")
+first_name = input("Enter the first name: ").strip().lower()
+last_name = input("Enter the last name: ").strip().lower()
+user_name = format_user_name(first_name, last_name)
+user_id = pass_user_id(user_name)
+
 # function to add data from gdf
-def insert_data_from_gdf(session, gdf, table_class):
+def insert_data_from_gdf(session, gdf, table_class, user_id):
     for idx, row in gdf.iterrows():
         geom = row['geometry']
         if isinstance(geom, str):
@@ -199,6 +309,9 @@ def insert_data_from_gdf(session, gdf, table_class):
 
         # Convert Shapely geometry to WKB format
         wkb_geometry = geom.wkb
+
+        # Current timestamp
+        date_now = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
 
         # Create an insert statement
         stmt = insert(table_class).values(
@@ -217,7 +330,9 @@ def insert_data_from_gdf(session, gdf, table_class):
             straat=row['straat'],
             huisnummer=row['huisnummer'],
             busnummer=row['busnummer'],
-            geometry=func.ST_GeomFromWKB(wkb_geometry)
+            geometry=func.ST_GeomFromWKB(wkb_geometry),
+            created_by = user_id,
+            created_at = date_now
         )
 
         # Execute the insert statement
@@ -227,8 +342,17 @@ def insert_data_from_gdf(session, gdf, table_class):
     session.commit()
 
 
-# Insert data from GeoDataFrame into the table
-insert_data_from_gdf(session, gdf, YourTable)
+# Main execution
+if __name__ == "__main__":
 
-# Close the session
-session.close()
+    schema='editeren'
+
+    if check_for_differences_and_prompt(session, gdf, YourTable, schema):
+        drop_existing_data(session, YourTable, schema)
+        insert_data_from_gdf(session, gdf, YourTable, user_id)
+
+    '''# Insert data from GeoDataFrame into the table
+    insert_data_from_gdf(session, gdf, YourTable)'''
+
+    # Close the session
+    session.close()
